@@ -45,7 +45,7 @@ if (!Array.isArray(data.waypoints) || data.waypoints.length < 2) data.waypoints 
 if (!Array.isArray(data.casetas)) data.casetas = [];
 
 /* ---------- ruta ---------- */
-let route = { ver: 0, approx: true, pts: [], cum: [], len: 0 };
+let route = { ver: 0, approx: true, custom: false, pts: [], cum: [], len: 0 };
 
 function hav(a, b) {
   const R = 6371000, r = Math.PI / 180;
@@ -57,7 +57,9 @@ function hav(a, b) {
 async function buildRoute() {
   const w = data.waypoints;
   let pts = null;
-  try {
+  const custom = Array.isArray(data.customRoute) && data.customRoute.length >= 2;
+  if (custom) pts = data.customRoute;
+  else try {
     const coords = w.map(p => p.lng + ',' + p.lat).join(';');
     const url = 'https://router.project-osrm.org/route/v1/driving/' + coords + '?overview=full&geometries=geojson';
     const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
@@ -70,12 +72,12 @@ async function buildRoute() {
   if (!pts) pts = w.map(p => [p.lat, p.lng]);
   const cum = [0];
   for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + hav(pts[i - 1], pts[i]));
-  route = { ver: route.ver + 1, approx, pts, cum, len: cum[cum.length - 1] };
+  route = { ver: route.ver + 1, approx, custom, pts, cum, len: cum[cum.length - 1] };
   for (const c of data.casetas) {
     const pr = project(c.lat, c.lng);
     c.s = pr ? pr.s : 0;
   }
-  console.log('Ruta lista:', pts.length, 'puntos,', Math.round(route.len), 'm', approx ? '(aproximada)' : '(por carretera)');
+  console.log('Ruta lista:', pts.length, 'puntos,', Math.round(route.len), 'm', custom ? '(grabada)' : approx ? '(aproximada)' : '(por carretera)');
 }
 
 function project(lat, lng) {
@@ -152,10 +154,10 @@ function send(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(body);
 }
-function readBody(req) {
+function readBody(req, limit) {
   return new Promise((resolve, reject) => {
     let size = 0; const chunks = [];
-    req.on('data', c => { size += c.length; if (size > 30000) { reject(new Error('Cuerpo muy grande')); req.destroy(); } else chunks.push(c); });
+    req.on('data', c => { size += c.length; if (size > limit) { reject(new Error('Cuerpo muy grande')); req.destroy(); } else chunks.push(c); });
     req.on('end', () => { try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}); } catch (e) { reject(new Error('JSON inválido')); } });
     req.on('error', reject);
   });
@@ -185,7 +187,7 @@ async function handleApi(req, res, pathname, query) {
   if (m === 'GET' && pathname === '/api/health') return send(res, 200, { ok: true, route: route.ver, approx: route.approx, casetas: data.casetas.length });
 
   if (m === 'GET' && pathname === '/api/route') {
-    return send(res, 200, { ver: route.ver, approx: route.approx, waypoints: data.waypoints, pts: route.pts, cum: route.cum.map(Math.round), len: Math.round(route.len) });
+    return send(res, 200, { ver: route.ver, approx: route.approx, custom: route.custom, waypoints: data.waypoints, pts: route.pts, cum: route.cum.map(Math.round), len: Math.round(route.len) });
   }
 
   if (m === 'GET' && pathname === '/api/stream') {
@@ -199,12 +201,13 @@ async function handleApi(req, res, pathname, query) {
 
   if (m === 'GET' && pathname === '/api/export') {
     if (query.get('pin') !== ADMIN_PIN) return send(res, 403, { error: 'PIN incorrecto' });
-    return send(res, 200, data);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="seed.json"', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify(data, null, 2));
   }
 
   if (m !== 'POST') return send(res, 404, { error: 'No existe' });
   let b;
-  try { b = await readBody(req); } catch (e) { return send(res, 400, { error: e.message }); }
+  try { b = await readBody(req, pathname === '/api/admin/route' ? 600000 : 30000); } catch (e) { return send(res, 400, { error: e.message }); }
 
   if (pathname === '/api/pos') {
     if (!okId(b.id) || !['driver', 'passenger'].includes(b.role) || ![1, -1].includes(b.dir) || !okNum(b.lat, -90, 90) || !okNum(b.lng, -180, 180)) return send(res, 400, { error: 'Datos inválidos' });
@@ -266,8 +269,39 @@ async function handleApi(req, res, pathname, query) {
   if (pathname === '/api/admin/waypoints') {
     if (b.pin !== ADMIN_PIN) return send(res, 403, { error: 'PIN incorrecto.' });
     const w = b.waypoints;
-    if (!Array.isArray(w) || w.length < 2 || w.length > 6 || !w.every(p => okNum(p.lat, -90, 90) && okNum(p.lng, -180, 180) && clean(p.name, 40).length >= 2)) return send(res, 400, { error: 'Puntos inválidos.' });
+    if (!Array.isArray(w) || w.length < 2 || w.length > 25 || !w.every(p => okNum(p.lat, -90, 90) && okNum(p.lng, -180, 180) && clean(p.name, 40).length >= 2)) return send(res, 400, { error: 'Puntos inválidos.' });
     data.waypoints = w.map(p => ({ name: clean(p.name, 40), lat: Number(p.lat.toFixed(6)), lng: Number(p.lng.toFixed(6)) }));
+    delete data.customRoute;
+    await buildRoute();
+    live.clear();
+    saveData(); kick();
+    return send(res, 200, { ok: true, approx: route.approx });
+  }
+
+  if (pathname === '/api/admin/route') {
+    if (b.pin !== ADMIN_PIN) return send(res, 403, { error: 'PIN incorrecto.' });
+    if (!Array.isArray(b.pts) || b.pts.length < 2 || b.pts.length > 6000 || !b.pts.every(q => Array.isArray(q) && okNum(q[0], -90, 90) && okNum(q[1], -180, 180))) return send(res, 400, { error: 'El recorrido grabado no es válido.' });
+    let pts = [b.pts[0]];
+    for (let i = 1; i < b.pts.length; i++) if (hav(pts[pts.length - 1], b.pts[i]) >= 8) pts.push(b.pts[i]);
+    let len = 0;
+    for (let i = 1; i < pts.length; i++) len += hav(pts[i - 1], pts[i]);
+    if (pts.length < 2 || len < 500) return send(res, 400, { error: 'El recorrido es muy corto (menos de 500 m).' });
+    const first = data.waypoints[0], last = data.waypoints[data.waypoints.length - 1];
+    let reversed = false;
+    if (hav(pts[0], [first.lat, first.lng]) > hav(pts[0], [last.lat, last.lng])) { pts.reverse(); reversed = true; }
+    if (pts.length > 3000) { const step = Math.ceil(pts.length / 3000); pts = pts.filter((q, i) => i % step === 0 || i === pts.length - 1); }
+    pts = pts.map(q => [Number(q[0].toFixed(6)), Number(q[1].toFixed(6))]);
+    data.customRoute = pts;
+    data.waypoints = [{ name: first.name, lat: pts[0][0], lng: pts[0][1] }, { name: last.name, lat: pts[pts.length - 1][0], lng: pts[pts.length - 1][1] }];
+    await buildRoute();
+    live.clear();
+    saveData(); kick();
+    return send(res, 200, { ok: true, points: pts.length, km: Number((route.len / 1000).toFixed(1)), reversed });
+  }
+
+  if (pathname === '/api/admin/route/reset') {
+    if (b.pin !== ADMIN_PIN) return send(res, 403, { error: 'PIN incorrecto.' });
+    delete data.customRoute;
     await buildRoute();
     live.clear();
     saveData(); kick();
