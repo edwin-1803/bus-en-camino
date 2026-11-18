@@ -1,0 +1,14 @@
+{
+  "name": "bus-en-camino",
+  "version": "0.2.0",
+  "description": "Ver en tiempo real si viene un bus: ruta Divalá – David.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
