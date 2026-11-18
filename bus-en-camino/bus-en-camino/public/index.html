@@ -60,6 +60,7 @@ select, input[type=text] { width: 100%; background: var(--bg); border: 1px solid
 .btn.primary { background: var(--accent); color: var(--on-accent); border-color: transparent; }
 .btn.danger { color: var(--bad); }
 .btn.small { padding: 6px 10px; font-size: 13px; }
+a.btn { text-decoration: none; display: inline-block; color: inherit; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .card { background: var(--bg); border: 1px solid var(--line); border-radius: 14px; padding: 14px; display: grid; gap: 4px; }
 .big { font-size: 24px; line-height: 1.15; font-weight: 700; text-wrap: balance; }
@@ -176,13 +177,32 @@ summary { cursor: pointer; font-weight: 600; }
         </div>
         <div id="kList"></div>
         <details id="adm">
-          <summary>Ajustar extremos de la ruta</summary>
-          <div class="small" style="margin:8px 0">Mueve el mapa hasta que la cruz roja quede sobre el punto exacto y toca el botón. Pide el PIN de administrador.</div>
+          <summary>Ajustar la ruta (administrador)</summary>
+          <div class="small" style="margin:8px 0" id="admRouteInfo"></div>
           <label class="lbl" for="admPin">PIN</label>
           <input type="text" id="admPin" inputmode="numeric" autocomplete="off">
-          <div class="row" style="margin-top:8px">
+
+          <div style="font-weight:700;margin-top:14px">Opción 1: grabar el recorrido real</div>
+          <div class="small" style="margin:4px 0 8px">Sube a un bus y toca grabar al salir de un extremo. Deja la pantalla encendida todo el viaje y toca detener al llegar. La ruta queda exactamente por donde pasó el bus.</div>
+          <div class="row">
+            <button class="btn small" id="recToggle"></button>
+            <button class="btn small primary" id="recUse" hidden>Usar como ruta oficial</button>
+            <button class="btn small danger" id="recDiscard" hidden>Descartar</button>
+          </div>
+          <div class="small" id="recInfo" style="margin-top:6px"></div>
+
+          <div style="font-weight:700;margin-top:14px">Opción 2: puntos de la ruta</div>
+          <div class="small" style="margin:4px 0 8px">Mueve el mapa hasta que la cruz roja quede sobre el punto y toca el botón. Con varios puntos de paso, la ruta sigue las carreteras que pasan por ellos.</div>
+          <div class="row">
             <button class="btn small" id="admStart"></button>
             <button class="btn small" id="admEnd"></button>
+            <button class="btn small" id="admVia">Agregar punto de paso en la cruz</button>
+          </div>
+          <ul class="list" id="admWps" style="margin-top:8px"></ul>
+
+          <div class="row" style="margin-top:12px">
+            <button class="btn small" id="admReset" hidden>Volver a la ruta automática</button>
+            <a class="btn small" id="admBackup" href="#">Descargar respaldo</a>
           </div>
           <div class="small" id="admMsg" style="margin-top:6px"></div>
         </details>
@@ -215,6 +235,7 @@ summary { cursor: pointer; font-weight: 600; }
   var offInfo = null;                     // metros fuera de la ruta, si el servidor lo avisa
   var addPos = null, tapMode = false;
   var lastSend = 0, adminPin = '';
+  var rec = { on: false, pts: [], len: 0 };
   try { adminPin = sessionStorage.getItem('bec_pin') || ''; } catch (e) { adminPin = ''; }
 
   /* ---------- API ---------- */
@@ -312,7 +333,7 @@ summary { cursor: pointer; font-weight: 600; }
 
   /* ---------- GPS ---------- */
   function updateGpsNeed() {
-    var need = mode !== null || tab === 'k' || Date.now() < locUntil;
+    var need = mode !== null || tab === 'k' || rec.on || Date.now() < locUntil;
     if (need) startGps(); else stopGps();
   }
   function startGps() {
@@ -340,6 +361,7 @@ summary { cursor: pointer; font-weight: 600; }
     else { meCircle.setLatLng(ll); meCircle.setRadius(gps.acc); }
     if (pendingNearest) { pendingNearest = false; pickNearest(); }
     if (pendingHere) { pendingHere = false; setAddPos(gps.lat, gps.lng, gps.acc); }
+    if (rec.on) recordPoint();
     if (mode && Date.now() - lastSend > 3000) sendPos();
     renderDriver();
   }
@@ -366,7 +388,7 @@ summary { cursor: pointer; font-weight: 600; }
   function setMode(m, dir) {
     mode = m; modeDir = dir; offInfo = null; lastSend = 0;
     if (m === null) { api('/api/leave', { id: cid }).catch(function () {}); }
-    holdScreen(m === 'driver');
+    holdScreen(m === 'driver' || rec.on);
     updateGpsNeed();
     if (m && gps) sendPos();
     renderRide(); renderDriver();
@@ -580,25 +602,118 @@ summary { cursor: pointer; font-weight: 600; }
       toast('Caseta guardada.'); $('kName').value = ''; clearAdd();
     }).catch(function (e) { $('kErr').textContent = e.message; });
   });
-  /* extremos de la ruta (administrador) */
+  /* ruta: extremos, puntos de paso y recorrido grabado (administrador) */
+  var wpsHtml = '';
   function renderAdm() {
+    if (!route) return;
     var n = names();
     $('admStart').textContent = 'Mover «' + n.start + '» a la cruz';
     $('admEnd').textContent = 'Mover «' + n.end + '» a la cruz';
+    $('admRouteInfo').textContent = route.custom ? 'Ruta actual: grabada de un recorrido real.' :
+      (route.approx ? 'Ruta actual: línea recta aproximada.' : 'Ruta actual: calculada automáticamente por carretera.');
+    $('admReset').hidden = !route.custom;
+    var h = '';
+    if (!route.custom) route.waypoints.forEach(function (w, i) {
+      var mid = i > 0 && i < route.waypoints.length - 1;
+      h += '<li><span class="nm">' + esc(w.name) + '</span><span>' + (mid ? '<button class="btn small danger" data-wp="' + i + '">Quitar</button>' : '') + '</span></li>';
+    });
+    if (h !== wpsHtml) { wpsHtml = h; $('admWps').innerHTML = h; }
+    renderRec();
   }
   $('adm').addEventListener('toggle', function () { $('cross').hidden = !$('adm').open; });
-  function moveWaypoint(idx) {
+  function pinVal() {
     var pin = $('admPin').value.trim();
     adminPin = pin; try { sessionStorage.setItem('bec_pin', pin); } catch (e) { /* nada */ }
-    var c = map.getCenter(), w = route.waypoints.map(function (p) { return { name: p.name, lat: p.lat, lng: p.lng }; });
-    var i = idx === 0 ? 0 : w.length - 1; w[i].lat = c.lat; w[i].lng = c.lng;
+    return pin;
+  }
+  function copyWps() { return route.waypoints.map(function (p) { return { name: p.name, lat: p.lat, lng: p.lng }; }); }
+  function postWps(w, okMsg) {
+    var pin = pinVal();
     $('admMsg').textContent = 'Guardando y calculando la ruta…';
     api('/api/admin/waypoints', { pin: pin, waypoints: w }).then(function (r) {
-      $('admMsg').textContent = r.approx ? 'Guardado. La ruta quedó como línea recta porque el servidor no pudo calcularla por carretera.' : 'Listo, ruta recalculada por carretera.';
+      $('admMsg').textContent = r.approx ? 'Guardado, pero el servidor no pudo calcular la ruta por carretera y quedó en línea recta.' : okMsg;
     }).catch(function (e) { $('admMsg').textContent = e.message; });
+  }
+  function moveWaypoint(idx) {
+    var c = map.getCenter(), w = copyWps(), i = idx === 0 ? 0 : w.length - 1;
+    w[i].lat = c.lat; w[i].lng = c.lng;
+    postWps(w, 'Listo, ruta recalculada por carretera.');
   }
   $('admStart').addEventListener('click', function () { moveWaypoint(0); });
   $('admEnd').addEventListener('click', function () { moveWaypoint(1); });
+  $('admVia').addEventListener('click', function () {
+    if (!route) return;
+    var c = map.getCenter(), pr = project(c.lat, c.lng), w = copyWps(), at = w.length - 1;
+    for (var i = 1; i < w.length - 1; i++) { var q = project(w[i].lat, w[i].lng); if (q && pr && q.s > pr.s) { at = i; break; } }
+    w.splice(at, 0, { name: 'Paso ' + w.length, lat: c.lat, lng: c.lng });
+    postWps(w, 'Punto de paso agregado y ruta recalculada.');
+  });
+  $('admWps').addEventListener('click', function (e) {
+    var i = e.target.getAttribute('data-wp'); if (i === null || !route) return;
+    var w = copyWps(); w.splice(Number(i), 1);
+    postWps(w, 'Punto quitado y ruta recalculada.');
+  });
+  $('admReset').addEventListener('click', function () {
+    var pin = pinVal();
+    api('/api/admin/route/reset', { pin: pin }).then(function (r) {
+      $('admMsg').textContent = r.approx ? 'Volvió a la ruta automática, pero quedó en línea recta.' : 'Volvió a la ruta automática por carretera.';
+    }).catch(function (e) { $('admMsg').textContent = e.message; });
+  });
+  $('admBackup').addEventListener('click', function () { this.href = '/api/export?pin=' + encodeURIComponent($('admPin').value.trim()); });
+
+  /* grabación del recorrido real */
+  var recLine = L.polyline([], { color: '#3b82f6', weight: 4, dashArray: '6 6' }).addTo(map);
+  function saveRec() { try { localStorage.setItem('bec_rec', JSON.stringify({ pts: rec.pts, len: rec.len })); } catch (e) { /* nada */ } }
+  function renderRec() {
+    var n = rec.pts.length;
+    $('recToggle').textContent = rec.on ? 'Detener grabación' : (n ? 'Seguir grabando' : 'Empezar a grabar');
+    $('recToggle').className = 'btn small' + (rec.on ? ' danger' : '');
+    $('recUse').hidden = rec.on || n < 2;
+    $('recDiscard').hidden = rec.on || n === 0;
+    $('recInfo').textContent = n ? (rec.on ? 'Grabando… ' : 'Grabación detenida. ') + n + ' puntos · ' + (rec.len / 1000).toFixed(1) + ' km' : 'Sin grabación.';
+  }
+  function recordPoint() {
+    if (!gps || gps.acc > 40) return;
+    var p = [Number(gps.lat.toFixed(5)), Number(gps.lng.toFixed(5))], last = rec.pts[rec.pts.length - 1];
+    if (last) { var d = hav(last, p); if (d < 10) return; rec.len += d; }
+    rec.pts.push(p); recLine.addLatLng(p); saveRec();
+    if (rec.pts.length >= 4000) { rec.on = false; toast('Se llegó al máximo de puntos y se detuvo la grabación.'); updateGpsNeed(); }
+    renderRec();
+  }
+  function clearRec() {
+    rec.on = false; rec.pts = []; rec.len = 0; recLine.setLatLngs([]);
+    try { localStorage.removeItem('bec_rec'); } catch (e) { /* nada */ }
+    holdScreen(mode === 'driver'); updateGpsNeed(); renderRec();
+  }
+  try {
+    var sv = JSON.parse(localStorage.getItem('bec_rec') || 'null');
+    if (sv && sv.pts && sv.pts.length) { rec.pts = sv.pts; rec.len = sv.len || 0; recLine.setLatLngs(sv.pts); }
+  } catch (e) { /* nada */ }
+  $('recToggle').addEventListener('click', function () {
+    rec.on = !rec.on;
+    if (rec.on) { holdScreen(true); toast('Grabando. Deja la pantalla encendida durante todo el recorrido.'); }
+    else holdScreen(mode === 'driver');
+    updateGpsNeed(); renderRec();
+  });
+  var discardTimer = null;
+  $('recDiscard').addEventListener('click', function () {
+    var b = $('recDiscard');
+    if (b.textContent !== '¿Seguro?') {
+      b.textContent = '¿Seguro?';
+      clearTimeout(discardTimer); discardTimer = setTimeout(function () { b.textContent = 'Descartar'; }, 4000);
+      return;
+    }
+    clearTimeout(discardTimer); b.textContent = 'Descartar'; clearRec();
+  });
+  $('recUse').addEventListener('click', function () {
+    var pin = pinVal();
+    $('admMsg').textContent = 'Guardando el recorrido…';
+    api('/api/admin/route', { pin: pin, pts: rec.pts }).then(function (r) {
+      var n = names();
+      $('admMsg').textContent = 'Ruta guardada: ' + r.km + ' km y ' + r.points + ' puntos' + (r.reversed ? ' (se invirtió el sentido para que vaya de ' + n.start + ' a ' + n.end + ')' : '') + '.';
+      clearRec();
+    }).catch(function (e) { $('admMsg').textContent = e.message; });
+  });
 
   /* ---------- pestañas y controles ---------- */
   function setTab(t) {
